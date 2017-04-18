@@ -23,6 +23,19 @@ def extract_lazy_object(lo):
     return lo._wrapped
 
 
+def apply_keys(function, mapping):
+    if not mapping:
+        return {}
+
+    keys, values = zip(*mapping.items())
+    return dict(
+        zip(
+            function(keys),
+            values,
+        ),
+    )
+
+
 def apply_values(function, mapping):
     """\
     Applies ``function`` to a sequence containing all of the values in the
@@ -45,6 +58,13 @@ def apply_values(function, mapping):
             function(values),
         ),
     )
+
+
+def collect(function, sequence):
+    result = {}
+    for value in sequence:
+        result.setdefault(function(value), []).append(value)
+    return result
 
 
 class LazyBackendWrapper(LazyObject):
