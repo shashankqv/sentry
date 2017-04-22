@@ -9,11 +9,9 @@ Schema Changes
 
 - Added ``Distribution`` model
 - Added ``ReleaseFile.dist`` column
-
-Schema Changes
-~~~~~~~~~~~~~~
-
 - Added ``CommitAuthor.external_id`` column
+- Added ``EventUser.name`` column
+- Added ``UserReport.event_user_id`` column
 
 Version 8.15
 ------------
