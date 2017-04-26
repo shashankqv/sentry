@@ -30,7 +30,7 @@ def unmerge(project, group_hashes, chunk=100):
     )
 
 
-def has_matching_fingerprint(group_hashes):
+def build_fingerprint_matcher(group_hashes):
     values = set(hash.hash for hash in group_hashes)
 
     def predicate(event):
@@ -230,15 +230,16 @@ def unmerge_chunk(project_id, source_group_ids, group_hash_ids, chunk, cursor, d
         id__in=group_hash_ids,
     )
 
-    events = filter(
-        has_matching_fingerprint(group_hashes),
-        candidates,
-    )
+    requires_migration = build_fingerprint_matcher(group_hashes)
 
-    logger.debug(
-        'Reduced %s candidate events to %s events requiring processing.',
-        len(events),
-        len(candidates),
+    def collect_events(result, event):
+        result[requires_migration(event)].append(event)
+        return result
+
+    events_to_repair, events_to_migrate = reduce(
+        collect_events,
+        candidates,
+        ([], []),
     )
 
     if destination_id is None:
@@ -250,7 +251,7 @@ def unmerge_chunk(project_id, source_group_ids, group_hash_ids, chunk, cursor, d
                     get_group_field_values,
                     project,
                 ),
-                events,
+                events_to_migrate,
                 {},
             )
         )
@@ -282,7 +283,7 @@ def unmerge_chunk(project_id, source_group_ids, group_hash_ids, chunk, cursor, d
                     get_group_field_values,
                     project,
                 ),
-                events,
+                events_to_migrate,
                 {name: getattr(destination, name) for name in extractors.keys()},
             )
         )
@@ -291,7 +292,7 @@ def unmerge_chunk(project_id, source_group_ids, group_hash_ids, chunk, cursor, d
         lambda keys: map(Group.objects.in_bulk(keys).get, keys),
         collect(
             lambda event: event.group_id,
-            events,
+            events_to_migrate,
         )
     )
 
@@ -301,7 +302,7 @@ def unmerge_chunk(project_id, source_group_ids, group_hash_ids, chunk, cursor, d
             times_seen=F('times_seen') - len(items),
         )
 
-    event_id_set = set(event.id for event in events)
+    event_id_set = set(event.id for event in events_to_migrate)
 
     Event.objects.filter(
         project_id=project.id,
@@ -313,7 +314,7 @@ def unmerge_chunk(project_id, source_group_ids, group_hash_ids, chunk, cursor, d
         event_id__in=event_id_set,
     ).update(group_id=destination.id)
 
-    event_event_id_set = set(event.event_id for event in events)
+    event_event_id_set = set(event.event_id for event in events_to_migrate)
 
     EventMapping.objects.filter(
         project_id=project.id,
@@ -325,7 +326,7 @@ def unmerge_chunk(project_id, source_group_ids, group_hash_ids, chunk, cursor, d
         event_id__in=event_event_id_set,
     ).update(group=destination)
 
-    for key, values in collect_tag_data(events).items():
+    for key, values in collect_tag_data(events_to_migrate).items():
         # TODO: This might need to repair the `first_seen` and `last_seen`
         # columns on the source group(s)?
 
@@ -366,7 +367,7 @@ def unmerge_chunk(project_id, source_group_ids, group_hash_ids, chunk, cursor, d
                     times_seen=F('times_seen') - count,
                 )
 
-    get_group_releases(project, destination, events)
+    get_group_releases(project, destination, events_to_migrate)
 
     # TODO: Handle TSDB.
 
