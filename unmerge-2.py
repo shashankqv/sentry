@@ -216,6 +216,11 @@ def unmerge_chunk(project_id, source_group_ids, group_hash_ids, chunk, cursor, d
             values_seen__lte=0,
         ).delete()
 
+        GroupHash.objects.filter(
+            id__in=group_hash_ids,
+            state=GroupHash.State.MIGRATION_IN_PROGRESS,
+        ).update(state=GroupHash.State.ACTIVE)
+
         return
 
     Event.objects.bind_nodes(candidates, 'data')
@@ -253,7 +258,11 @@ def unmerge_chunk(project_id, source_group_ids, group_hash_ids, chunk, cursor, d
         GroupHash.objects.filter(
             project=project,
             id__in=group_hash_ids,
-        ).update(group=destination)
+            state=GroupHash.State.ACTIVE,  # TODO: Assert before starting
+        ).update(
+            group=destination,
+            state=GroupHash.State.MIGRATION_IN_PROGRESS,
+        )
         watermark = Event.objects.filter(
             group_id__in=source_group_ids,
         ).aggregate(
