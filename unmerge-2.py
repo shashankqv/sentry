@@ -6,7 +6,7 @@ configure()
 import functools
 import logging
 
-from django.db.models import F, Max
+from django.db.models import F
 
 from sentry.constants import DEFAULT_LOGGER_NAME, LOG_LEVELS_MAP
 from sentry.event_manager import ScoreClause, generate_culprit, get_hashes_for_event, md5_from_hash
@@ -24,7 +24,6 @@ def unmerge(project, group_hashes, chunk=100):
         set([h.group_id for h in group_hashes]),
         set([h.id for h in group_hashes]),
         chunk,
-        0,
         None,
         None,
     )
@@ -39,45 +38,45 @@ def build_fingerprint_matcher(group_hashes):
     return predicate
 
 
-extractors = {
-    'culprit': lambda fields, event: generate_culprit(
+initial_field_extractors = {
+    'culprit': lambda event: generate_culprit(
         event.data,
         event.platform,
     ),
-    'data': lambda fields, event: {
+    'data': lambda event: {
         'last_received': event.data.get('received') or float(event.datetime.strftime('%s')),
         'type': event.data['type'],
         'metadata': event.data['metadata'],
     },
-    'last_seen': lambda fields, event: event.datetime,
-    'level': lambda fields, event: LOG_LEVELS_MAP.get(
+    'last_seen': lambda event: event.datetime,
+    'level': lambda event: LOG_LEVELS_MAP.get(
         event.get_tag('level'),
         logging.ERROR,
     ),
-    'message': lambda fields, event: event.message if event.message else fields['message'],
+    'message': lambda event: event.message,
+    'times_seen': lambda event: 0,
+}
+
+
+update_field_extractors = {
+    'platform': lambda fields, event: event.platform,
+    'logger': lambda fields, event: event.get_tag('logger') or DEFAULT_LOGGER_NAME,
+    'first_seen': lambda fields, event: event.datetime,
+    'active_at': lambda fields, event: event.datetime,
+    'first_release': lambda fields, event: Release.objects.get(
+        organization_id=event.project.organization_id,  # XXX
+        version=event.get_tag('sentry:release')
+    ) if event.get_tag('sentry:release') else None,
+    'times_seen': lambda fields, event: fields['times_seen'] + 1,
     'score': lambda fields, event: ScoreClause.calculate(
         fields['times_seen'] + 1,
-        event.datetime,
+        fields['last_seen'],
     ),
-    'times_seen': lambda fields, event: fields['times_seen'] + 1,
 }
 
 
 def get_group_field_values(project, fields, event):
-    if not fields:
-        fields.update({
-            'platform': event.platform,
-            'logger': event.get_tag('logger') or DEFAULT_LOGGER_NAME,
-            'first_seen': event.datetime,
-            'active_at': event.datetime,
-            'first_release': Release.objects.get(
-                organization_id=project.organization_id,
-                version=event.get_tag('sentry:release')
-            ) if event.get_tag('sentry:release') else None,
-            'times_seen': 0,
-        })
-
-    fields.update({name: extractor(fields, event) for name, extractor in extractors.items()})
+    fields.update({name: f(fields, event) for name, f in update_field_extractors.items()})
     return fields
 
 
@@ -101,8 +100,8 @@ def collect_tag_data(events):
                 sources[event.group_id] = sources.get(event.group_id, 0) + 1
                 values[value] = (
                     count + 1,
-                    first_seen,
                     event.datetime,
+                    last_seen,
                     sources,
                 )
         return tags
@@ -142,14 +141,12 @@ def get_group_releases(project, destination, events):
             defaults, update = attributes[key]
             # TODO: This doesn't exactly match the behavior that is defined on
             # the model, but it's close enough for now.
-            update['last_seen'] = event.datetime
+            update['first_seen'] = event.datetime
         else:
             attributes[key] = ({
                 'first_seen': event.datetime,
                 'last_seen': event.datetime,
-            }, {
-                'last_seen': event.datetime,
-            })
+            }, {})
 
         return key
 
@@ -158,7 +155,6 @@ def get_group_releases(project, destination, events):
     releases = {}
     for key, (defaults, update) in attributes.items():
         environment, release_id = key
-        # TODO: This also suffers from the clobbering issue.
         instance, created = GroupRelease.objects.get_or_create(
             project_id=project.id,
             group_id=destination.id,
@@ -167,7 +163,7 @@ def get_group_releases(project, destination, events):
             defaults=defaults,
         )
 
-        if not created:
+        if not created and update:
             instance.update(**update)
 
         releases[key] = instance
@@ -181,17 +177,18 @@ def get_group_releases(project, destination, events):
     )
 
 
-def unmerge_chunk(project_id, source_group_ids, group_hash_ids, chunk, cursor, destination_id, watermark):
+def unmerge_chunk(project_id, source_group_ids, group_hash_ids, chunk, cursor, destination_id):
     project = Project.objects.get(id=project_id)
 
-    queryset = Event.objects.order_by('id').filter(
+    queryset = Event.objects.order_by('-id').filter(
         project_id=project.id,
         group_id__in=source_group_ids,
-        id__gt=cursor,
     )
 
-    if watermark is not None:
-        queryset = queryset.filter(id__lte=watermark)
+    if cursor is not None:
+        queryset = queryset.filter(
+            id__lt=cursor,
+        )
 
     candidates = list(queryset[:chunk])
 
@@ -242,134 +239,127 @@ def unmerge_chunk(project_id, source_group_ids, group_hash_ids, chunk, cursor, d
         ([], []),
     )
 
-    if destination_id is None:
-        destination = Group.objects.create(
+    if events_to_migrate:
+        if destination_id is None:
+            destination = Group.objects.create(
+                project_id=project.id,
+                short_id=project.next_short_id(),
+                **reduce(
+                    functools.partial(
+                        get_group_field_values,
+                        project,
+                    ),
+                    events_to_migrate,
+                    {name: f(events_to_migrate[0]) for name, f in initial_field_extractors.items()},
+                )
+            )
+            destination_id = destination.id
+            GroupHash.objects.filter(
+                project=project,
+                id__in=group_hash_ids,
+                state=GroupHash.State.ACTIVE,  # TODO: Assert before starting
+            ).update(
+                group=destination,
+                state=GroupHash.State.MIGRATION_IN_PROGRESS,
+            )
+        else:
+            destination = Group.objects.get(
+                project=project,
+                id=destination_id,
+            )
+            destination.update(
+                **reduce(
+                    functools.partial(
+                        get_group_field_values,
+                        project,
+                    ),
+                    events_to_migrate,
+                    {name: getattr(destination, name) for name in set(initial_field_extractors.keys()) | set(update_field_extractors.keys())},
+                )
+            )
+
+        events_by_source = apply_keys(
+            lambda keys: map(Group.objects.in_bulk(keys).get, keys),
+            collect(
+                lambda event: event.group_id,
+                events_to_migrate,
+            )
+        )
+
+        # TODO: handle unlikely None case
+        for source, items in events_by_source.items():
+            source.update(
+                times_seen=F('times_seen') - len(items),
+            )
+
+        event_id_set = set(event.id for event in events_to_migrate)
+
+        Event.objects.filter(
             project_id=project.id,
-            short_id=project.next_short_id(),
-            **reduce(
-                functools.partial(
-                    get_group_field_values,
-                    project,
-                ),
-                events_to_migrate,
-                {},
-            )
-        )
-        destination_id = destination.id
-        GroupHash.objects.filter(
+            id__in=event_id_set,
+        ).update(group_id=destination.id)
+
+        EventTag.objects.filter(
+            project_id=project.id,
+            event_id__in=event_id_set,
+        ).update(group_id=destination.id)
+
+        event_event_id_set = set(event.event_id for event in events_to_migrate)
+
+        EventMapping.objects.filter(
+            project_id=project.id,
+            event_id__in=event_event_id_set,
+        ).update(group_id=destination.id)
+
+        UserReport.objects.filter(
             project=project,
-            id__in=group_hash_ids,
-            state=GroupHash.State.ACTIVE,  # TODO: Assert before starting
-        ).update(
-            group=destination,
-            state=GroupHash.State.MIGRATION_IN_PROGRESS,
-        )
-        watermark = Event.objects.filter(
-            group_id__in=source_group_ids,
-        ).aggregate(
-            id=Max('id'),
-        )['id']
-    else:
-        destination = Group.objects.get(
-            project=project,
-            id=destination_id,
-        )
-        # XXX: This will clobber incoming, newer data, and we'll need to find a
-        # way around that, otherwise fields like `times_seen` and `last_seen`
-        # will be incorrect. This is also the same for tags below.
-        destination.update(
-            **reduce(
-                functools.partial(
-                    get_group_field_values,
-                    project,
-                ),
-                events_to_migrate,
-                {name: getattr(destination, name) for name in extractors.keys()},
-            )
-        )
+            event_id__in=event_event_id_set,
+        ).update(group=destination)
 
-    events_by_source = apply_keys(
-        lambda keys: map(Group.objects.in_bulk(keys).get, keys),
-        collect(
-            lambda event: event.group_id,
-            events_to_migrate,
-        )
-    )
+        for key, values in collect_tag_data(events_to_migrate).items():
+            # TODO: This might need to repair the `first_seen` and `last_seen`
+            # columns on the source group(s)?
 
-    # TODO: handle unlikely None case
-    for source, items in events_by_source.items():
-        source.update(
-            times_seen=F('times_seen') - len(items),
-        )
-
-    event_id_set = set(event.id for event in events_to_migrate)
-
-    Event.objects.filter(
-        project_id=project.id,
-        id__in=event_id_set,
-    ).update(group_id=destination.id)
-
-    EventTag.objects.filter(
-        project_id=project.id,
-        event_id__in=event_id_set,
-    ).update(group_id=destination.id)
-
-    event_event_id_set = set(event.event_id for event in events_to_migrate)
-
-    EventMapping.objects.filter(
-        project_id=project.id,
-        event_id__in=event_event_id_set,
-    ).update(group_id=destination.id)
-
-    UserReport.objects.filter(
-        project=project,
-        event_id__in=event_event_id_set,
-    ).update(group=destination)
-
-    for key, values in collect_tag_data(events_to_migrate).items():
-        # TODO: This might need to repair the `first_seen` and `last_seen`
-        # columns on the source group(s)?
-
-        GroupTagKey.objects.get_or_create(
-            project=project,
-            group=destination,
-            key=key,
-        )
-
-        for value, (times_seen, first_seen, last_seen, sources) in values.items():
-            instance, created = GroupTagValue.objects.get_or_create(
+            GroupTagKey.objects.get_or_create(
                 project=project,
                 group=destination,
                 key=key,
-                value=value,
-                defaults={
-                    'first_seen': first_seen,
-                    'last_seen': last_seen,
-                    'times_seen': times_seen,
-                },
             )
 
-            if not created:
-                instance.update(
-                    last_seen=last_seen,
-                    times_seen=F('times_seen') + times_seen,
-                )
-
-            for source_id, count in sources.items():
-                # TODO: Protect against running negative.
-                # TODO: What happens if this doesn't actually affect any rows?
-                GroupTagValue.objects.filter(
+            for value, (times_seen, first_seen, last_seen, sources) in values.items():
+                instance, created = GroupTagValue.objects.get_or_create(
                     project=project,
-                    group_id=source_id,
+                    group=destination,
                     key=key,
                     value=value,
-                ).update(
-                    times_seen=F('times_seen') - count,
+                    defaults={
+                        'first_seen': first_seen,
+                        'last_seen': last_seen,
+                        'times_seen': times_seen,
+                    },
                 )
 
-    get_group_releases(project, destination, events_to_migrate)
+                if not created:
+                    instance.update(
+                        first_seen=first_seen,
+                        times_seen=F('times_seen') + times_seen,
+                    )
 
-    # TODO: Handle TSDB.
+                for source_id, count in sources.items():
+                    # TODO: Protect against running negative.
+                    # TODO: What happens if this doesn't actually affect any rows?
+                    GroupTagValue.objects.filter(
+                        project=project,
+                        group_id=source_id,
+                        key=key,
+                        value=value,
+                    ).update(
+                        times_seen=F('times_seen') - count,
+                    )
+
+        get_group_releases(project, destination, events_to_migrate)
+
+        # TODO: Handle TSDB.
 
     return unmerge_chunk(
         project_id,
@@ -378,5 +368,4 @@ def unmerge_chunk(project_id, source_group_ids, group_hash_ids, chunk, cursor, d
         chunk,
         candidates[-1].id,
         destination_id,
-        watermark,
     )
