@@ -8,6 +8,7 @@ import logging
 
 from django.db.models import F
 
+from sentry.app import tsdb
 from sentry.constants import DEFAULT_LOGGER_NAME, LOG_LEVELS_MAP
 from sentry.event_manager import ScoreClause, generate_culprit, get_hashes_for_event, md5_from_hash
 from sentry.models import Event, EventMapping, EventTag, Group, GroupHash, GroupRelease, GroupTagKey, GroupTagValue, Project, Release, UserReport
@@ -254,6 +255,7 @@ def unmerge_chunk(project_id, source_group_ids, group_hash_ids, chunk, cursor, d
                 )
             )
             destination_id = destination.id
+
             GroupHash.objects.filter(
                 project=project,
                 id__in=group_hash_ids,
@@ -262,6 +264,19 @@ def unmerge_chunk(project_id, source_group_ids, group_hash_ids, chunk, cursor, d
                 group=destination,
                 state=GroupHash.State.MIGRATION_IN_PROGRESS,
             )
+
+            tsdb.delete([
+                tsdb.models.group,
+            ], source_group_ids)
+
+            tsdb.delete_distinct_counts([
+                tsdb.models.users_affected_by_group,
+            ], source_group_ids)
+
+            tsdb.delete_frequencies([
+                tsdb.models.frequent_releases_by_group,
+                tsdb.models.frequent_environments_by_group,
+            ], source_group_ids)
         else:
             destination = Group.objects.get(
                 project=project,
